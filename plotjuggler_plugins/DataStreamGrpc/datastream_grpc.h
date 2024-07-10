@@ -1,29 +1,36 @@
 #pragma once
 
-#include <QtPlugin>
-#include <thread>
+#include "perfdata.grpc.pb.h"
 #include "PlotJuggler/datastreamer_base.h"
 
-class DataStreamGrpc : public PJ::DataStreamer
+#include <grpcpp/grpcpp.h>
+
+#include <QtPlugin>
+#include <thread>
+
+class GrpcDataStreamer : public PJ::DataStreamer, public rocksdb::PerfDataService::Service
 {
-  Q_OBJECT
+Q_OBJECT
   Q_PLUGIN_METADATA(IID "facontidavide.PlotJuggler3.DataStreamer")
   Q_INTERFACES(PJ::DataStreamer)
 
 public:
-  DataStreamGrpc();
+  GrpcDataStreamer();
 
   virtual bool start(QStringList*) override;
 
   virtual void shutdown() override;
 
-  virtual bool isRunning() const override;
+  virtual bool isRunning() const override
+  {
+    return _running;
+  }
 
-  virtual ~DataStreamGrpc() override;
+  virtual ~GrpcDataStreamer() override;
 
   virtual const char* name() const override
   {
-    return "Grpc Streamer";
+    return "GrpcDataStreamer";
   }
 
   virtual bool isDebugPlugin() override
@@ -31,33 +38,9 @@ public:
     return false;
   }
 
-  virtual bool xmlSaveState(QDomDocument& doc,
-                            QDomElement& parent_element) const override;
-
-  virtual bool xmlLoadState(const QDomElement& parent_element) override;
-
-  std::pair<QAction*, int> notificationAction() override
-  {
-    return { _dummy_notification, _notifications_count };
-  }
+  grpc::Status SendPerfData(grpc::ServerContext* context, const rocksdb::PerfDataRequest* request, rocksdb::PerfDataResponse* response) override;
 
 private:
-  struct Parameters
-  {
-    double A, B, C, D;
-  };
-
-  void loop();
-
-  std::thread _thread;
-
   bool _running;
-
-  std::map<std::string, Parameters> _parameters;
-
-  void pushSingleCycle();
-
-  QAction* _dummy_notification;
-
-  int _notifications_count;
+  std::unique_ptr<grpc::Server> server_;
 };

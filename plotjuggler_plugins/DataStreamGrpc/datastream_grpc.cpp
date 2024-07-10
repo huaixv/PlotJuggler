@@ -1,145 +1,151 @@
 #include "datastream_grpc.h"
+#include "ui_datastream_grpc.h"
+
 #include <QTextStream>
 #include <QFile>
 #include <QMessageBox>
 #include <QDebug>
-#include <thread>
+#include <QSettings>
+#include <QDialog>
+#include <QWebSocket>
+#include <QIntValidator>
+#include <QMessageBox>
+#include <QNetworkDatagram>
+#include <QNetworkInterface>
+
 #include <mutex>
 #include <chrono>
-#include <thread>
-#include <math.h>
+#include <iostream>
+#include <memory>
+#include <string>
 
-using namespace PJ;
+using grpc::Server;
+using grpc::ServerBuilder;
+using grpc::ServerContext;
+using grpc::Status;
+using rocksdb::Metric;
+using rocksdb::PerfDataRequest;
+using rocksdb::PerfDataResponse;
+using rocksdb::PerfDataService;
+using rocksdb::PerfResponseStatus;
 
-DataStreamGrpc::DataStreamGrpc()
+class GrpcDataStreamerDialog : public QDialog
 {
-  _dummy_notification = new QAction(this);
-
-  connect(_dummy_notification, &QAction::triggered, this, [this]() {
-    QMessageBox::warning(nullptr, "Dummy Notifications",
-                         QString("%1 notifications").arg(_notifications_count),
-                         QMessageBox::Ok);
-
-    if (_notifications_count > 0)
-    {
-      _notifications_count = 0;
-      emit notificationsChanged(_notifications_count);
-    }
-  });
-
-  _notifications_count = 0;
-  for (int i = 0; i < 150; i++)
+public:
+  GrpcDataStreamerDialog() : QDialog(nullptr), ui(new Ui::GrpcDataStreamerDialog)
   {
-    auto str = QString("data_vect/%1").arg(i).toStdString();
-    DataStreamGrpc::Parameters param;
-    param.A = 6 * ((double)rand() / (double)RAND_MAX) - 3;
-    param.B = 3 * ((double)rand() / (double)RAND_MAX);
-    param.C = 3 * ((double)rand() / (double)RAND_MAX);
-    param.D = 20 * ((double)rand() / (double)RAND_MAX);
-    _parameters.insert({ str, param });
-    auto& plotdata = dataMap().addNumeric(str)->second;
+    ui->setupUi(this);
+    setWindowTitle("Grpc Data Streamer");
+
+    connect(ui->buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(ui->buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
   }
-  //------------
-  dataMap().addStringSeries("color");
-
-  //------------
-  auto tcGroup = std::make_shared<PJ::PlotGroup>("tc");
-  tcGroup->setAttribute(TEXT_COLOR, QColor(Qt::blue));
-
-  auto& tc_default = dataMap().addNumeric("tc/default")->second;
-  auto& tc_red = dataMap().addNumeric("tc/red")->second;
-
-  tc_red.setAttribute(TEXT_COLOR, QColor(Qt::red));
-}
-
-bool DataStreamGrpc::start(QStringList*)
-{
-  _running = true;
-  pushSingleCycle();
-  _thread = std::thread([this]() { this->loop(); });
-  return true;
-}
-
-void DataStreamGrpc::shutdown()
-{
-  _running = false;
-  if (_thread.joinable())
+  ~GrpcDataStreamerDialog()
   {
-    _thread.join();
+    delete ui;
   }
-}
+  Ui::GrpcDataStreamerDialog* ui;
+};
 
-bool DataStreamGrpc::isRunning() const
+GrpcDataStreamer::GrpcDataStreamer() : _running(false)
 {
-  return _running;
 }
 
-DataStreamGrpc::~DataStreamGrpc()
+GrpcDataStreamer::~GrpcDataStreamer()
 {
   shutdown();
 }
 
-bool DataStreamGrpc::xmlSaveState(QDomDocument& doc, QDomElement& parent_element) const
+bool GrpcDataStreamer::start(QStringList*)
 {
-  return true;
-}
-
-bool DataStreamGrpc::xmlLoadState(const QDomElement& parent_element)
-{
-  return true;
-}
-
-void DataStreamGrpc::pushSingleCycle()
-{
-  static int count = 0;
-  std::lock_guard<std::mutex> lock(mutex());
-
-  using namespace std::chrono;
-  static auto initial_time = high_resolution_clock::now();
-  const double offset =
-      duration_cast<duration<double>>(initial_time.time_since_epoch()).count();
-
-  auto now = high_resolution_clock::now();
-  std::string colors[] = { "RED", "BLUE", "GREEN" };
-
-  const double stamp =
-      duration_cast<duration<double>>(now - initial_time).count() + offset;
-
-  for (auto& it : _parameters)
+  if (_running)
   {
-    auto& plot = dataMap().numeric.find(it.first)->second;
-    const DataStreamGrpc::Parameters& param = it.second;
-
-    double val = param.A * sin(param.B * stamp + param.C) + param.D;
-    plot.pushBack(PlotData::Point(stamp, val));
+    return _running;
   }
 
-  auto& col_series = dataMap().strings.find("color")->second;
-  col_series.pushBack({ stamp, colors[(count / 10) % 3] });
+  if (parserFactories() == nullptr || parserFactories()->empty())
+  {
+    QMessageBox::warning(nullptr, tr("Grpc Data Streamer"),
+                         tr("No available MessageParsers"), QMessageBox::Ok);
+    _running = false;
+    return false;
+  }
 
-  auto& tc_default = dataMap().numeric.find("tc/default")->second;
-  tc_default.pushBack({ stamp, double(count) });
+  bool ok = false;
 
-  auto& tc_red = dataMap().numeric.find("tc/red")->second;
-  tc_red.pushBack({ stamp, double(count) });
+  GrpcDataStreamerDialog dialog;
 
-  count++;
+  // load previous values
+  QSettings settings;
+  QString address_str =
+      settings.value("GrpcDataStreamer::address", "0.0.0.0:50051").toString();
+
+  dialog.ui->lineEditAddress->setText(address_str);
+
+  int res = dialog.exec();
+  if (res == QDialog::Rejected)
+  {
+    _running = false;
+    return false;
+  }
+
+  address_str = dialog.ui->lineEditAddress->text();
+
+  // save back to service
+  settings.setValue("GrpcDataStreamer::address", address_str);
+
+  QHostAddress address(address_str);
+
+  bool success = true;
+  success &= !address.isNull();
+
+  // start grpc service here
+  ServerBuilder builder;
+  builder.AddListeningPort(address_str.toStdString(), grpc::InsecureServerCredentials());
+  builder.RegisterService(this);
+
+  server_ = builder.BuildAndStart();
+
+  _running = true;
+
+  return _running;
 }
 
-void DataStreamGrpc::loop()
+void GrpcDataStreamer::shutdown()
 {
-  _running = true;
-  size_t count = 1;
-  while (_running)
+  if (_running)
   {
-    auto prev = std::chrono::high_resolution_clock::now();
-    pushSingleCycle();
-    emit dataReceived();
-    if (count++ % 200 == 0)
+    // shutdown grpc service
+    server_.get()->Shutdown();
+    _running = false;
+  }
+}
+
+grpc::Status GrpcDataStreamer::SendPerfData(grpc::ServerContext* context,
+                                            const rocksdb::PerfDataRequest* request,
+                                            rocksdb::PerfDataResponse* response)
+{
+  qDebug() << "Received performance data at timestamp: " << request->timestamp() << "\n";
+  try
+  {
+    for (const Metric& metric : request->metrics())
     {
-      _notifications_count++;
-      emit notificationsChanged(_notifications_count);
+      auto& series = dataMap().getOrCreateNumeric(metric.key());
+      series.pushBack({ request->timestamp(), metric.value() });
+
+      qDebug() << metric.key().c_str() << ": " << metric.value() << "\n";
     }
-    std::this_thread::sleep_until(prev + std::chrono::milliseconds(20));  // 50 Hz
+
+    emit dataReceived();
+    response->set_status(PerfResponseStatus::SUCCESS);
+    return Status::OK;
+  }
+  catch (std::exception& err)
+  {
+    shutdown();
+    // notify the GUI
+    emit closed();
+    response->set_status(PerfResponseStatus::FAILURE);
+    return Status::CANCELLED;
   }
 }
