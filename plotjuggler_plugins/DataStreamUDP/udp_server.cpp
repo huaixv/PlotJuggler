@@ -97,7 +97,7 @@ bool UDP_Server::start(QStringList*)
 
   // load previous values
   QSettings settings;
-  QString protocol = settings.value("UDP_Server::protocol", "JSON").toString();
+  QString protocol = settings.value("UDP_Server::protocol", "json").toString();
   QString address_str = settings.value("UDP_Server::address", "127.0.0.1").toString();
   int port = settings.value("UDP_Server::port", 9870).toInt();
 
