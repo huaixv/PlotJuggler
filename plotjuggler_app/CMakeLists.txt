@@ -87,6 +87,7 @@ SET( PLOtJUGGLER_SRC
     transforms/outlier_removal.cpp
     transforms/integral_transform.cpp
     transforms/absolute_transform.cpp
+    transforms/log_transform.cpp
     transforms/samples_count.cpp
 
     transforms/first_derivative.cpp
